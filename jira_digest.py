@@ -318,8 +318,9 @@ def load_data(auth, force, assignee_names, since):
     """Return the tickets of the given assignees created on or after since,
     from the cache when it holds them and is fresh.
 
-    The cache holds one fetch: the tickets of one set of assignees from one
-    start date. Asking for other assignees, or an earlier date, refetches.
+    The cache holds one fetch: the tickets of one set of assignees in one set
+    of projects from one start date. Asking for other assignees, other
+    projects (JIRA_PROJECTS changed), or an earlier date, refetches.
     Fetches start no later than January 1 of this year so that the default
     "created after" filter never needs another fetch.
     """
@@ -328,7 +329,9 @@ def load_data(auth, force, assignee_names, since):
     if data:
         age = time.time() - CACHE_FILE.stat().st_mtime
         covers = data["since"] is None or (since is not None and data["since"] <= since)
-        if not force and age < CACHE_MAX_AGE and covers and data["query"] == query:
+        if (not force and age < CACHE_MAX_AGE and covers
+                and data["query"] == query
+                and data.get("projects") == PROJECTS):
             print(f"(cached {int(age // 60)} min ago; --force to refresh)",
                   file=sys.stderr)
             return data
@@ -342,6 +345,7 @@ def load_data(auth, force, assignee_names, since):
         "version": CACHE_VERSION,
         "me": me,
         "query": query,
+        "projects": PROJECTS,
         "assignees": assignees,
         "since": fetch_since,
         "tickets": fetch_tickets(auth, assignees, fetch_since),
