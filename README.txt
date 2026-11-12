@@ -103,7 +103,8 @@ Options:
   --columns A,B       Columns to show, in this order, from: ticket, title,
                       status, severity, labels, parent, project, type,
                       priority, assignee, reporter, created, updated,
-                      fixversions, components, resolution.
+                      fixversions, components, resolution. "assignee"
+                      shows the assignee's initials: "Jane Doe" is "JD".
                       Default: ticket,title,status,priority,severity,labels.
                       Priority is always shown: if it's left out, or put
                       after severity, it goes just before severity.
@@ -149,6 +150,13 @@ with nothing checked means everything, so unchecking both default statuses
 shows tickets in every status. "Defaults" goes back to the default filters.
 "Fetch from Jira" refetches regardless of the cache.
 
+The Assignee dropdown lists "Me", "Unassigned", and everyone who can be
+assigned tickets in the JIRA_PROJECTS. Type in its search box to narrow the
+list, tick one or more people, and close the list (click outside it or
+press Escape) to apply. The list of people is fetched from Jira once a day
+(it takes a few seconds) and kept in ~/.cache/jira-digest/users.json;
+delete that file to refetch it sooner.
+
 Clicking the Ticket, Status, Severity, or Priority header sorts the table
 by that column, descending first and ascending on the next click; an arrow in the
 header shows the direction. Reloading the page restores the default order
@@ -159,6 +167,9 @@ column check boxes follow the shown order, so the new order stays in the
 page's URL like the other filters until "Defaults" is clicked. The Priority
 column is always shown and stays before Severity; its box can't be
 unticked.
+
+The Assignee column shows the assignee's initials (hover over them for the
+full name). It is off by default.
 
 Clicking a ticket key or title opens the ticket in Jira in a separate
 browser window, where you can edit it, change its status, or comment as

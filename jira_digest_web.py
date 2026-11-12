@@ -51,6 +51,18 @@ PAGE = """<!DOCTYPE html>
   input[type=text] {{ width: 180px; }}
   .boxes {{ max-height: 130px; overflow-y: auto; }}
   .boxes label {{ display: block; white-space: nowrap; }}
+  .boxes label[hidden] {{ display: none; }}
+  /* Assignee dropdown */
+  .pick {{ position: relative; }}
+  .pick summary {{ cursor: pointer; background: #fff; border: 1px solid #d1d9e0;
+                   border-radius: 4px; padding: 2px 8px; width: 180px;
+                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .pick .panel {{ position: absolute; z-index: 50; top: 100%; left: 0;
+                  background: #fff; border: 1px solid #d1d9e0; border-radius: 6px;
+                  padding: 8px; min-width: 260px;
+                  box-shadow: 0 8px 24px rgba(0,0,0,0.2); }}
+  .pick .boxes {{ max-height: 280px; }}
+  .pick input[type=search] {{ width: 100%; box-sizing: border-box; margin-bottom: 6px; }}
   .buttons {{ align-self: flex-end; display: flex; gap: 8px; }}
   button {{ padding: 4px 12px; }}
   table {{ border-collapse: collapse; width: 100%; }}
@@ -109,8 +121,14 @@ PAGE = """<!DOCTYPE html>
   <input type="hidden" name="f" value="1">
   <fieldset>
     <span class="label">Assignee</span>
-    <input type="text" name="assignee" value="{assignee}" placeholder="me"
-           list="people" title="Names, emails, or account ids, comma separated; also me and unassigned">
+    <details class="pick" id="who">
+      <summary title="Pick whose tickets to show; closing the list applies the change">{assignee}</summary>
+      <div class="panel">
+        <input type="search" id="who-search" placeholder="Find a person"
+               autocomplete="off" data-lpignore="true" data-1p-ignore>
+        <div class="boxes">{assignees}</div>
+      </div>
+    </details>
   </fieldset>
   <fieldset>
     <span class="label">Project</span>
@@ -138,11 +156,13 @@ PAGE = """<!DOCTYPE html>
   </fieldset>
   <fieldset>
     <span class="label">Labels in</span>
-    <input type="text" name="labels" value="{labels}" placeholder="a,b">
+    <input type="text" name="labels" value="{labels}" placeholder="a,b"
+           autocomplete="off" data-lpignore="true" data-1p-ignore>
   </fieldset>
   <fieldset>
     <span class="label">Labels not in</span>
-    <input type="text" name="not_labels" value="{not_labels}" placeholder="a,b">
+    <input type="text" name="not_labels" value="{not_labels}" placeholder="a,b"
+           autocomplete="off" data-lpignore="true" data-1p-ignore>
   </fieldset>
   <fieldset>
     <span class="label">Columns</span>
@@ -157,7 +177,6 @@ PAGE = """<!DOCTYPE html>
     <a href="/" title="Back to the default filters">Defaults</a>
   </div>
 </form>
-<datalist id="people">{people}</datalist>
 <table>
 <thead><tr>{headers}</tr></thead>
 <tbody>
@@ -219,8 +238,34 @@ PAGE = """<!DOCTYPE html>
     }});
   }});
   // Check boxes and the date apply as soon as they change; text fields on Enter.
-  document.querySelectorAll("#filters input[type=checkbox], #filters input[type=date]")
+  document.querySelectorAll(
+    "#filters input[type=checkbox]:not([name=assignee]), #filters input[type=date]")
     .forEach(el => el.addEventListener("change", () => el.form.submit()));
+  // The assignee dropdown: a change of people refetches from Jira, so it
+  // applies when the list closes rather than on every tick. The search box
+  // narrows the list; it has no name, so it isn't part of the filters.
+  const who = document.getElementById("who");
+  const whoSearch = document.getElementById("who-search");
+  const whoBoxes = Array.from(who.querySelectorAll("input[type=checkbox]"));
+  const picked = () => whoBoxes.filter(b => b.checked);
+  const pickedAtLoad = picked().map(b => b.value).join();
+  whoBoxes.forEach(b => b.addEventListener("change", () => {{
+    who.querySelector("summary").textContent =
+      picked().map(p => p.parentNode.textContent.trim()).join(", ") || "Me";
+  }}));
+  who.addEventListener("toggle", () => {{
+    if (who.open) whoSearch.focus();
+    else if (picked().map(b => b.value).join() !== pickedAtLoad)
+      document.getElementById("filters").submit();
+  }});
+  whoSearch.addEventListener("input", () => {{
+    const q = whoSearch.value.trim().toLowerCase();
+    whoBoxes.forEach(b =>
+      b.parentNode.hidden = !b.parentNode.textContent.toLowerCase().includes(q));
+  }});
+  document.addEventListener("click", e => {{
+    if (who.open && !who.contains(e.target)) who.open = false;
+  }});
   const modal = document.getElementById("modal");
   const content = document.getElementById("modal-content");
   function openTicket(key) {{
@@ -246,7 +291,9 @@ PAGE = """<!DOCTYPE html>
     el.addEventListener("click", e => {{ e.preventDefault(); openTicket(el.dataset.key); }}));
   document.getElementById("modal-close").addEventListener("click", () => modal.hidden = true);
   modal.addEventListener("click", e => {{ if (e.target === modal) modal.hidden = true; }});
-  document.addEventListener("keydown", e => {{ if (e.key === "Escape") modal.hidden = true; }});
+  document.addEventListener("keydown", e => {{
+    if (e.key === "Escape") {{ modal.hidden = true; who.open = false; }}
+  }});
 </script>
 </body>
 </html>
@@ -264,7 +311,11 @@ def filter_args(query):
     explicit = "f" in query
     columns = [c for c in query.get("columns", []) if c in digest.COLUMNS]
     return argparse.Namespace(
-        assignee=digest.parse_names(first(query, "assignee")),
+        # One value per ticked person; a typed URL may also list several
+        # names in one value, comma separated.
+        assignee=[
+            n for v in query.get("assignee", []) for n in digest.parse_names(v)
+        ],
         project={p.lower() for p in query.get("project", [])},
         status={s.lower() for s in query.get("status", [])}
         if explicit else digest.parse_list(digest.DEFAULT_STATUSES),
@@ -314,6 +365,13 @@ def cell_html(row, column):
             f'<a class="title open" href="{escape(row["url"])}"'
             f' title="Open the ticket in Jira in a separate window">{escape(row["summary"])}</a>'
         )
+    if column == "assignee":
+        if not row["assignee"]:
+            return "-"
+        return (
+            f'<span title="{escape(row["assignee"])}">'
+            f'{escape(digest.initials(row["assignee"]))}</span>'
+        )
     if column == "severity":
         return severity_html(row["severity"])
     if column == "parent":
@@ -328,7 +386,7 @@ def cell_html(row, column):
     return escape(digest.cell_text(row, column))
 
 
-NOWRAP = {"ticket", "status", "severity", "parent", "created", "updated", "priority", "type", "project"}
+NOWRAP = {"ticket", "assignee", "status", "severity", "parent", "created", "updated", "priority", "type", "project"}
 
 
 SORTABLE = ["ticket", "status", "severity", "priority"]
@@ -486,22 +544,41 @@ def column_options(shown):
     return [(c, digest.COLUMNS[c]) for c in order]
 
 
-def people_options(data):
-    names = {t["assignee"] for t in data["tickets"]} | {data["me"]["name"]}
-    names.discard("")
-    return "".join(
-        f'<option value="{escape(x)}">' for x in sorted(names, key=str.lower)
-    )
+def assignee_options(data, users):
+    """The assignee check boxes and the lower case values that are ticked:
+    "me" and "unassigned", then the Jira users by name, with their account
+    ids as values. The people whose tickets are shown are listed even when
+    users lacks them (the user fetch failed, or they can no longer be
+    assigned), so that they can be unticked."""
+    me = data["me"]
+    people = {u["id"]: u["name"] for u in users}
+    chosen = set()
+    for a in data["assignees"]:
+        if a["id"] is None:
+            chosen.add("unassigned")
+        elif a["id"] == me["id"]:
+            chosen.add("me")
+        else:
+            chosen.add(a["id"].lower())
+            people.setdefault(a["id"], a["name"])
+    people.pop(me["id"], None)
+    options = [("me", f'Me ({me["name"]})'), ("unassigned", "Unassigned")]
+    options += sorted(people.items(), key=lambda p: p[1].lower())
+    return options, chosen
 
 
-def render(query, data, error=""):
+def render(query, data, users, error=""):
     args = filter_args(query)
     title, rows = digest.select_rows(data, args)
+    people, chosen = assignee_options(data, users)
     return PAGE.format(
         title=escape(title),
         cache=escape(cache_note()),
         error=f'<div class="failure">{escape(error)}</div>' if error else "",
-        assignee=escape(first(query, "assignee")),
+        assignee=escape(
+            ", ".join(label for v, label in people if v.lower() in chosen)
+        ),
+        assignees=boxes("assignee", people, chosen),
         projects=boxes("project", project_options(data), args.project),
         statuses=boxes("status", status_options(data), args.status),
         priorities=boxes("priority", priority_options(data), args.priority),
@@ -514,7 +591,6 @@ def render(query, data, error=""):
             "columns", column_options(args.columns), set(args.columns),
             fixed={digest.ALWAYS_COLUMN},
         ),
-        people=people_options(data),
         headers="".join(header_html(c) for c in args.columns),
         rows=table_rows(rows, args.columns),
         tickets="\n".join(ticket_html(r) for r in rows),
@@ -524,6 +600,7 @@ def render(query, data, error=""):
 class Handler(BaseHTTPRequestHandler):
     auth = None
     data = None  # the last ticket data loaded
+    users = []  # the last list of assignable people loaded
     lock = threading.Lock()  # one fetch at a time
 
     def do_GET(self):
@@ -547,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.data is None:
             self.send_error(500, explain=error)
             return
-        body = render(query, Handler.data, error).encode()
+        body = render(query, Handler.data, Handler.users, error).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -555,16 +632,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def load(self, args, force):
-        """Load the ticket data into Handler.data and return an error message,
-        or "" on success. On failure the last good data is kept."""
-        try:
-            with Handler.lock:
+        """Load the ticket data into Handler.data and the assignable people
+        into Handler.users, and return an error message, or "" on success.
+        On failure the last good data is kept."""
+        errors = []
+        with Handler.lock:
+            try:
                 Handler.data = digest.load_data(
                     Handler.auth, force, args.assignee, args.created
                 )
-            return ""
-        except Exception as e:  # show any fetch failure on the page
-            return f"Fetching from Jira failed: {e}"
+            except Exception as e:  # show any fetch failure on the page
+                errors.append(f"Fetching from Jira failed: {e}")
+            try:
+                Handler.users = digest.load_users(Handler.auth)
+            except Exception as e:
+                errors.append(f"Fetching the assignee list from Jira failed: {e}")
+        return "\n".join(errors)
 
     def log_message(self, fmt, *args):
         pass

@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -98,7 +99,7 @@ TEXT_WIDTHS = {
     "project": 7,
     "type": 6,
     "priority": 8,
-    "assignee": 18,
+    "assignee": 8,
     "reporter": 18,
     "created": 10,
     "updated": 10,
@@ -110,6 +111,12 @@ TEXT_WIDTHS = {
 CACHE_FILE = Path.home() / ".cache" / "jira-digest" / "tickets.json"
 CACHE_MAX_AGE = 4 * 3600
 CACHE_VERSION = 2  # bump when FIELDS or simplify() change
+
+# The people who can be assigned tickets in PROJECTS, for the web page's
+# assignee list. They change rarely, so they are kept longer than tickets.
+USERS_CACHE_FILE = CACHE_FILE.with_name("users.json")
+USERS_MAX_AGE = 24 * 3600
+USERS_PAGE_SIZE = 1000
 
 PAGE_SIZE = 100
 API_RETRIES = 3
@@ -223,6 +230,49 @@ def resolve_assignees(auth, names, me):
         if who not in out:
             out.append(who)
     return out
+
+
+def fetch_users(auth):
+    """Return the active people who can be assigned tickets in any of
+    PROJECTS, as {"id", "name"} sorted by name."""
+    def project_users(project):
+        found, start = [], 0
+        while True:
+            page = jira_request(
+                auth, "/rest/api/3/user/assignable/search",
+                params={"project": project, "startAt": start, "maxResults": USERS_PAGE_SIZE},
+            )
+            if not page:
+                return found
+            found += page
+            start += USERS_PAGE_SIZE
+
+    # A project open to the whole site has thousands of people and takes a
+    # few seconds, so the projects are asked at the same time.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pages = list(pool.map(project_users, PROJECTS))
+    names = {}
+    for u in (u for page in pages for u in page):
+        if u.get("accountType", "atlassian") == "atlassian" and u.get("active", True):
+            names[u["accountId"]] = u.get("displayName") or u["accountId"]
+    return sorted(
+        ({"id": i, "name": n} for i, n in names.items()),
+        key=lambda u: u["name"].lower(),
+    )
+
+
+def load_users(auth):
+    """Return fetch_users(), from its cache when that is fresh and was made
+    for the same PROJECTS."""
+    if USERS_CACHE_FILE.exists():
+        age = time.time() - USERS_CACHE_FILE.stat().st_mtime
+        cached = json.loads(USERS_CACHE_FILE.read_text())
+        if age < USERS_MAX_AGE and cached.get("projects") == PROJECTS:
+            return cached["users"]
+    users = fetch_users(auth)
+    USERS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USERS_CACHE_FILE.write_text(json.dumps({"projects": PROJECTS, "users": users}))
+    return users
 
 
 def fetch_tickets(auth, assignees, since):
@@ -471,8 +521,16 @@ def select_rows(data, args):
 # Output
 
 
+def initials(name):
+    """The first letter of each word of a person's name: "Jane van Doe" gives
+    "JVD". Words that don't start with a letter or digit are skipped."""
+    return "".join(w[0].upper() for w in name.split() if w[0].isalnum())
+
+
 def cell_text(row, column):
     """The plain text of one table cell."""
+    if column == "assignee":
+        return initials(row["assignee"]) or "-"
     value = row[{"ticket": "key", "title": "summary"}.get(column, column)]
     if isinstance(value, list):
         value = ", ".join(value)
