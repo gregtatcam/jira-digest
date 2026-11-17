@@ -17,6 +17,7 @@ JIRA_NOT_LABELS); see README.txt.
 """
 
 import argparse
+import json
 import re
 import sys
 import threading
@@ -27,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import jira_digest as digest
+import ticket_summary
 
 SCRIPT_TAG = re.compile(r"<script\b.*?</script>", re.DOTALL | re.IGNORECASE)
 RELATIVE_URL = re.compile(r'\b(href|src)="/')
@@ -109,6 +111,7 @@ PAGE = """<!DOCTYPE html>
   .ticket .body img {{ max-width: 100%; }}
   .ticket .body table {{ width: auto; }}
   .ticket .empty {{ color: #59636e; font-style: italic; }}
+  .ticket .summary {{ white-space: pre-wrap; }}
   .comment {{ border-top: 1px solid #eaeef2; padding: 6px 0; }}
   .comment .who {{ color: #59636e; font-size: 12px; margin-bottom: 2px; }}
 </style>
@@ -273,6 +276,20 @@ PAGE = """<!DOCTYPE html>
     content.querySelectorAll("a").forEach(a => a.target = "_blank");
     modal.hidden = false;
     content.scrollTop = 0;
+    loadSummary(key, content.querySelector(".summary"));
+  }}
+  // The preview starts with a short summary of the ticket, asked of the
+  // server each time the preview opens; the server writes it once and
+  // saves it.
+  async function loadSummary(key, box) {{
+    try {{
+      const resp = await fetch("/summary?key=" + encodeURIComponent(key));
+      const summary = await resp.json();
+      box.textContent = summary.text || "(No summary: " + summary.error + ")";
+      box.classList.toggle("empty", !summary.text);
+    }} catch (e) {{
+      box.textContent = "(No summary: " + e.message + ")";
+    }}
   }}
   // The key and title open the real Jira page in one separate browser
   // window, reused for every ticket, so changes can be made there. Jira
@@ -471,10 +488,29 @@ def ticket_html(row):
         f'<div class="ticket" id="t-{escape(row["key"])}" hidden>'
         f'<h2><a href="{escape(row["url"])}">{escape(row["key"])}</a> {escape(row["summary"])}</h2>'
         f"<dl>{dl}</dl>"
+        '<h3>Summary</h3><div class="body summary empty">Summarizing...</div>'
         f"<h3>Description</h3>{description}"
         f"<h3>{escape(heading)}</h3>{comments or '<div class=empty>(none)</div>'}"
         "</div>"
     )
+
+
+def ticket_summary_of(key, data):
+    """Return a ticket's summary as {"title", "text"}: the saved one, or one
+    written now from the loaded ticket and saved. Returns {"error"} when
+    there is no saved summary and one can't be written."""
+    found = ticket_summary.saved(key)
+    if found:
+        return found
+    row = next((t for t in (data or {}).get("tickets", []) if t["key"] == key), None)
+    if row is None:
+        return {"error": f"{key} isn't among the loaded tickets"}
+    try:
+        return ticket_summary.summary(
+            key, row["summary"], ticket_summary.plain_text(row["description"])
+        )
+    except RuntimeError as e:
+        return {"error": str(e)}
 
 
 def boxes(name, options, chosen, fixed=()):
@@ -605,10 +641,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        query = parse_qs(url.query)
+        if url.path == "/summary":
+            self.send_summary(first(query, "key"))
+            return
         if url.path != "/":
             self.send_error(404)
             return
-        query = parse_qs(url.query)
         args = filter_args(query)
         if "force" in query:
             error = self.load(args, force=True)
@@ -627,6 +666,16 @@ class Handler(BaseHTTPRequestHandler):
         body = render(query, Handler.data, Handler.users, error).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_summary(self, key):
+        """Answer the preview's request for a ticket's summary with JSON:
+        {"title", "text"}, or {"error"} when there is none to give."""
+        body = json.dumps(ticket_summary_of(key, Handler.data)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

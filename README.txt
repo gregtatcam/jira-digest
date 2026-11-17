@@ -182,6 +182,21 @@ The small (i) icon next to the key shows a read-only preview in the page,
 from the cached data: the ticket's fields, description, and comments.
 Close it with the Close button, Escape, or a click outside it.
 
+The preview starts with a summary: a few sentences on what the ticket is
+about, written by the claude command (Claude Code,
+https://claude.com/claude-code), which must be installed and logged in. The
+ticket's title and description are sent to Claude for this. A summary is
+written once, the first time a ticket's preview opens (it takes a few
+seconds), and saved in ~/.cache/jira-digest/summaries.json; it isn't
+rewritten when the ticket changes, so delete the ticket's entry there (or
+the file) to have it written again. Without the claude command the preview
+says so and shows the rest as before.
+
+The saved summaries are shared with pr-review-digest
+(https://github.com/gregtatcam/pr-review-digest), which shows them next to
+a PR's tickets; either one writes a summary the other then reuses.
+ticket_summary.py is the same file in both projects.
+
 After changing a ticket in Jira, press "Fetch from Jira" to see the change
 in the table; the cache doesn't notice edits on its own.
 
