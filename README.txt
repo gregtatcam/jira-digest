@@ -100,6 +100,13 @@ Options:
                       so "oracle" matches Price_Oracle.
   --not-labels A,B    Skip tickets with a label that contains one of these,
                       or "none". Default: JIRA_NOT_LABELS, if set.
+  --labels-mode M     How the --labels list combines: "or" shows a ticket
+                      with any of the labels, "and" only a ticket with all
+                      of them. Default: or.
+  --not-labels-mode M How the --not-labels list combines: "and" skips a
+                      ticket with any of the labels (not A and not B), "or"
+                      skips only a ticket with all of them (not A or not
+                      B). Default: and.
   --columns A,B       Columns to show, in this order, from: ticket, title,
                       status, severity, labels, parent, project, type,
                       priority, assignee, reporter, created, updated,
@@ -140,7 +147,9 @@ Ctrl-C.
 
 The page has the same filters as the options above: assignee, project,
 status, priority, severity, parent, and column check boxes, the created-after date,
-and the "labels in" and "labels not in" text fields. With boxes ticked in
+and the "labels in" and "labels not in" text fields, each with an or/and
+choice for how its list combines (see --labels-mode and --not-labels-mode).
+With boxes ticked in
 both the Priority and Severity groups a ticket is shown if either matches,
 while every other filter must match too. The parent boxes list
 the parents (epics and so on) of the fetched tickets, with "(none)" for

@@ -65,6 +65,8 @@ PRIORITY_ORDER = [
 # --status or --not-labels says otherwise.
 DEFAULT_STATUSES = "To Do,Open,In Progress,In Review"
 DEFAULT_NOT_LABELS = os.environ.get("JIRA_NOT_LABELS", "")
+# How a list of labels combines, for --labels-mode and --not-labels-mode.
+LABEL_MODES = ["or", "and"]
 
 # Columns that can be shown, in the order they appear, and the defaults.
 COLUMNS = {
@@ -484,11 +486,21 @@ def select_rows(data, args):
     severity are set a ticket needs to match either one, not both; the
     other filters all have to match.
     A label filter matches a ticket label that contains it, so "oracle"
-    matches "Price_Oracle"."""
+    matches "Price_Oracle".
+    labels_mode says how a list of labels combines: "or" (the default)
+    keeps a ticket that has any of them, "and" one that has all of them.
+    not_labels_mode does the same for not_labels: "and" (the default)
+    keeps a ticket that has none of them (not a and not b), "or" one that
+    lacks at least one (not a or not b), so only a ticket with all of them
+    is skipped."""
 
-    def has_label(ticket, wanted):
+    def has_label(ticket, wanted, every=False):
         labels = [label.lower() for label in ticket["labels"]]
-        return any(w in label for w in wanted for label in labels)
+        found = (any(w in label for label in labels) for w in wanted)
+        return all(found) if every else any(found)
+
+    labels_all = getattr(args, "labels_mode", "or") == "and"
+    not_labels_all = getattr(args, "not_labels_mode", "and") == "or"
 
     rows = []
     for t in data["tickets"]:
@@ -505,9 +517,9 @@ def select_rows(data, args):
             continue
         if args.created and t["created"] < args.created:
             continue
-        if args.labels and not has_label(t, args.labels):
+        if args.labels and not has_label(t, args.labels, labels_all):
             continue
-        if args.not_labels and has_label(t, args.not_labels):
+        if args.not_labels and has_label(t, args.not_labels, not_labels_all):
             continue
         rows.append(t)
     # Newest first within a project and severity; sorts are stable.
@@ -670,6 +682,19 @@ def parse_args():
         default=parse_list(DEFAULT_NOT_LABELS),
         metavar="A,B",
         help=f"skip tickets with a label containing one of these, or none (default: {DEFAULT_NOT_LABELS or 'none'})",
+    )
+    parser.add_argument(
+        "--labels-mode",
+        choices=LABEL_MODES,
+        default="or",
+        help="how the --labels list combines: or needs any of them, and needs all of them (default: or)",
+    )
+    parser.add_argument(
+        "--not-labels-mode",
+        choices=LABEL_MODES,
+        default="and",
+        help="how the --not-labels list combines: and skips a ticket with any of them, "
+             "or skips only a ticket with all of them (default: and)",
     )
     parser.add_argument(
         "--columns",

@@ -158,12 +158,18 @@ PAGE = """<!DOCTYPE html>
     <input type="date" name="created" value="{created}">
   </fieldset>
   <fieldset>
-    <span class="label">Labels in</span>
+    <span class="label">Labels in
+      <select name="labels_mode"
+              title="or: a ticket with any of the labels; and: a ticket with all of them">
+        {labels_modes}</select></span>
     <input type="text" name="labels" value="{labels}" placeholder="a,b"
            autocomplete="off" data-lpignore="true" data-1p-ignore>
   </fieldset>
   <fieldset>
-    <span class="label">Labels not in</span>
+    <span class="label">Labels not in
+      <select name="not_labels_mode"
+              title="and: skip a ticket with any of the labels (not a and not b); or: skip only a ticket with all of them (not a or not b)">
+        {not_labels_modes}</select></span>
     <input type="text" name="not_labels" value="{not_labels}" placeholder="a,b"
            autocomplete="off" data-lpignore="true" data-1p-ignore>
   </fieldset>
@@ -240,9 +246,10 @@ PAGE = """<!DOCTYPE html>
       from.querySelector("input").form.submit();
     }});
   }});
-  // Check boxes and the date apply as soon as they change; text fields on Enter.
+  // Check boxes, the date, and the label and/or choices apply as soon as
+  // they change; text fields on Enter.
   document.querySelectorAll(
-    "#filters input[type=checkbox]:not([name=assignee]), #filters input[type=date]")
+    "#filters input[type=checkbox]:not([name=assignee]), #filters input[type=date], #filters select")
     .forEach(el => el.addEventListener("change", () => el.form.submit()));
   // The assignee dropdown: a change of people refetches from Jira, so it
   // applies when the list closes rather than on every tick. The search box
@@ -321,6 +328,20 @@ def first(query, name):
     return query.get(name, [""])[0].strip()
 
 
+def label_mode(query, name, default):
+    """The "or" or "and" picked for a label list; default if absent or odd."""
+    mode = first(query, name).lower()
+    return mode if mode in digest.LABEL_MODES else default
+
+
+def mode_options(chosen):
+    """The <option>s of a label mode dropdown, with chosen selected."""
+    return "".join(
+        f'<option{" selected" if m == chosen else ""}>{m}</option>'
+        for m in digest.LABEL_MODES
+    )
+
+
 def filter_args(query):
     """Turn the page's query string into the arguments select_rows() takes.
     Without the hidden "f" field (a fresh page) the defaults apply; with it,
@@ -343,6 +364,8 @@ def filter_args(query):
         labels=digest.parse_list(first(query, "labels")),
         not_labels=digest.parse_list(first(query, "not_labels"))
         if explicit else digest.parse_list(digest.DEFAULT_NOT_LABELS),
+        labels_mode=label_mode(query, "labels_mode", "or"),
+        not_labels_mode=label_mode(query, "not_labels_mode", "and"),
         columns=digest.with_always_column(columns or digest.DEFAULT_COLUMNS),
     )
 
@@ -623,6 +646,8 @@ def render(query, data, users, error=""):
         created=escape(args.created or ""),
         labels=escape(", ".join(sorted(args.labels))),
         not_labels=escape(", ".join(sorted(args.not_labels))),
+        labels_modes=mode_options(args.labels_mode),
+        not_labels_modes=mode_options(args.not_labels_mode),
         columns=boxes(
             "columns", column_options(args.columns), set(args.columns),
             fixed={digest.ALWAYS_COLUMN},
