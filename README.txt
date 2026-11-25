@@ -205,7 +205,10 @@ from the cached data: the ticket's fields, description, and comments.
 Close it with the Close button, Escape, or a click outside it.
 
 "review" next to the key starts a review of the ticket with Claude Code:
-it opens a new Terminal window (macOS only), goes to JIRA_REVIEW_DIR, and
+it takes a Terminal tab (macOS only) that is idle, that is, a shell at its
+prompt with nothing running in it (so not one with a Claude Code session),
+or opens a new Terminal window when no tab is idle, brings it to the front,
+goes to JIRA_REVIEW_DIR, and
 runs claude with the prompt "Review Jira ticket PROJ-123", which also asks
 it to resume from a document on the ticket that is already there (one with
 PROJ123 or PROJ-123 in its name) rather than start over. The first time,
