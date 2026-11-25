@@ -32,6 +32,8 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
+import fix_effort
+
 # ---------------------------------------------------------------------------
 # Settings
 
@@ -74,6 +76,7 @@ COLUMNS = {
     "title": "Title",
     "status": "Status",
     "severity": "Severity",
+    "effort": "Effort",  # to fix the ticket, 1 to 5; see fix_effort.py
     "labels": "Labels",
     "parent": "Parent",
     "project": "Project",
@@ -87,7 +90,9 @@ COLUMNS = {
     "components": "Components",
     "resolution": "Resolution",
 }
-DEFAULT_COLUMNS = ["ticket", "title", "status", "priority", "severity", "labels"]
+DEFAULT_COLUMNS = [
+    "ticket", "title", "status", "priority", "severity", "effort", "labels",
+]
 ALWAYS_COLUMN = "priority"  # shown whatever --columns says, before severity
 
 # Column widths of the terminal table.
@@ -96,6 +101,7 @@ TEXT_WIDTHS = {
     "title": 56,
     "status": 12,
     "severity": 8,
+    "effort": 6,
     "labels": 30,
     "parent": 10,
     "project": 7,
@@ -543,6 +549,9 @@ def cell_text(row, column):
     """The plain text of one table cell."""
     if column == "assignee":
         return initials(row["assignee"]) or "-"
+    if column == "effort":
+        # The saved estimate; one is made only from the web page.
+        return fix_effort.label(row) or "-"
     value = row[{"ticket": "key", "title": "summary"}.get(column, column)]
     if isinstance(value, list):
         value = ", ".join(value)

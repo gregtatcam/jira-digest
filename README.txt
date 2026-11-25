@@ -26,9 +26,11 @@ Files
   jira_digest.sh        wrapper that finds JIRA_TOKEN and runs jira_digest.py
   jira_digest_web.py    local web server around jira_digest.py
   jira_digest_web.sh    wrapper that finds JIRA_TOKEN and runs jira_digest_web.py
+  ticket_summary.py     the preview's summary of a ticket, written by Claude
+  fix_effort.py         the estimate of the work to fix a ticket, by Claude
 
-Keep the four files in one directory; the web server imports jira_digest.py
-from its own directory.
+Keep the files in one directory; the scripts import one another from their
+own directory.
 
 Requirements
 ------------
@@ -121,11 +123,14 @@ Options:
                       skips only a ticket with all of them (not A or not
                       B). Default: and.
   --columns A,B       Columns to show, in this order, from: ticket, title,
-                      status, severity, labels, parent, project, type,
-                      priority, assignee, reporter, created, updated,
+                      status, severity, effort, labels, parent, project,
+                      type, priority, assignee, reporter, created, updated,
                       fixversions, components, resolution. "assignee"
                       shows the assignee's initials: "Jane Doe" is "JD".
-                      Default: ticket,title,status,priority,severity,labels.
+                      "effort" shows the fix effort estimated on the web
+                      page, as 3/5, or "-" (see "Fix effort" below).
+                      Default:
+                      ticket,title,status,priority,severity,effort,labels.
                       Priority is always shown: if it's left out, or put
                       after severity, it goes just before severity.
   --markdown          Print a Markdown table instead of the text table.
@@ -179,7 +184,7 @@ press Escape) to apply. The list of people is fetched from Jira once a day
 (it takes a few seconds) and kept in ~/.cache/jira-digest/users.json;
 delete that file to refetch it sooner.
 
-Clicking the Ticket, Status, Severity, or Priority header sorts the table
+Clicking the Ticket, Status, Severity, Priority, or Effort header sorts the table
 by that column, descending first and ascending on the next click; an arrow in the
 header shows the direction. Reloading the page restores the default order
 (project, then severity, then newest first).
@@ -211,7 +216,11 @@ or opens a new Terminal window when no tab is idle, brings it to the front,
 goes to JIRA_REVIEW_DIR, and
 runs claude with the prompt "Review Jira ticket PROJ-123", which also asks
 it to resume from a document on the ticket that is already there (one with
-PROJ123 or PROJ-123 in its name) rather than start over. The first time,
+PROJ123 or PROJ-123 in its name) rather than start over. The small "+"
+after "review" opens a text field for extra instructions: type them and
+press Enter, and the review (or resume) starts with them added to that
+prompt after "Additional instructions:"; Escape or another click on "+"
+puts the field away. The first time,
 macOS may ask to let the server control Terminal. "review" is greyed out
 for a ticket that a running Claude Code session was started on this way
 (the ticket key is in the session's command line), so that a ticket isn't
@@ -222,14 +231,66 @@ of "review"; click it to bring the session's Terminal window to the front.
 
 "review" reads "resume" for a ticket you have a document on, and "notes"
 with a date under the key opens that document (the newest when there are
-several, and the date it was last changed); see JIRA_DOCS_DIR above. Next
-to it are the ticket's open PRs, each a link to the PR on GitHub: the PRs
+several, and the date it was last changed); see JIRA_DOCS_DIR above. Under
+it are the ticket's open PRs, one per line, each a link to the PR on GitHub: the PRs
 that name the ticket in their title or branch, or link to it in their
 description. They come from the PRs that pr-review-digest, a sibling
 project, has fetched and saved (~/.cache/pr-review-digest/prs.json), so
 they are as fresh as its last fetch, and absent without it.
 
-None of this uses Claude: only the preview's summary does, once per ticket.
+None of this uses Claude: only the preview's summary and the fix effort do,
+each once per ticket.
+
+Fix effort. The Effort column estimates how much work a ticket is to fix,
+from 1 to 5:
+
+  1  trivial: a one-line or configuration change, under an hour or two
+  2  small: one place to change, plus a test; up to a day
+  3  medium: several files, or some investigation first; a few days
+  4  large: design work, several components, or an unknown cause; a week
+     or two
+  5  very large: weeks of work, a change of protocol or architecture, or
+     open-ended
+
+A ticket has nothing to count the way a PR has changed lines, so the
+estimate is Claude's reading of the ticket: its title, fields, description,
+and comments are sent to the claude command, which answers with the score
+and a sentence on why (hover over the score to read it; the preview shows
+it too). Claude sees the ticket only, not the code, so take it as a rough
+guide.
+
+An estimate costs Claude usage: about 10,000 tokens for a ticket of average
+length, nearly all of it the ticket's text, and some 10 seconds. So each
+ticket is estimated once and the estimate is saved in
+~/.cache/jira-digest/efforts.json. After each fetch from Jira (and when the
+server starts) the server estimates, by itself and one at a time, the
+tickets of the default page (your open tickets of this year, see the
+default filters) that have no effort saved; the first time that is every
+one of them and takes some minutes, after that only the new tickets. The
+page fills in the scores as they are done. Set JIRA_EFFORT_AUTO=0 to turn
+this off. A ticket outside the default page shows "?" until you click it,
+which estimates it; "Estimate effort", by the filters, does every ticket
+shown that has none, one at a time, after telling you how many (click it
+again to stop).
+
+A saved estimate stays until you click the score to have it made again. One
+made before the ticket last changed is greyed and reads "3?"; it isn't
+made again by itself. The model and the prompt are EFFORT_MODEL and
+EFFORT_PROMPT in fix_effort.py.
+
+A review of the ticket knows the effort better than an estimate from the
+ticket's text, having read the code. So the prompt that "review" starts
+Claude Code with also asks it to record the effort it arrives at, by
+running
+
+  python3 fix_effort.py PROJ-123 2 "One sentence on why."
+
+(with the script's full path). That replaces the estimate, is never
+estimated over by itself or marked out of date, and shows when the page
+is reloaded; hover over the score to see that it came from the review.
+Claude Code may ask your permission to run the command. A session you
+start yourself isn't asked to record anything unless you tell it to, or
+put the command in your Claude Code instructions.
 
 The preview starts with a summary: a few sentences on what the ticket is
 about, written by the claude command (Claude Code,

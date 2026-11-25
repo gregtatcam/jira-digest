@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import fix_effort
 import jira_digest as digest
 import ticket_summary
 
@@ -82,6 +83,16 @@ FOCUS_SCRIPT = [
     'return ""',
     "end run",
 ]
+
+# The command a review session runs to record the effort it arrived at.
+EFFORT_SCRIPT = Path(__file__).resolve().parent / "fix_effort.py"
+# Whether to estimate the fix effort of the tickets on the default page
+# after each fetch, so that the Effort column is filled in without asking;
+# JIRA_EFFORT_AUTO=0 turns it off. See estimate_ahead().
+EFFORT_AUTO = os.environ.get("JIRA_EFFORT_AUTO", "1").strip().lower() not in (
+    "0", "no", "off", "false", "")
+AHEAD_LOCK = threading.Lock()
+AHEAD_FAILURES = 3  # estimates in a row that may fail before it gives up
 
 # Given to the page and required back by its links; see do_POST.
 TOKEN = secrets.token_urlsafe()
@@ -134,8 +145,15 @@ PAGE = """<!DOCTYPE html>
   a.jira {{ margin-left: 4px; text-decoration: none; font-size: 12px; }}
   a.review {{ margin-left: 6px; font-size: 12px; }}
   a.reviewing {{ color: #afb8c1; cursor: default; text-decoration: none; }}
+  /* "+" after "review": type more instructions for the review first. */
+  a.with {{ margin-left: 3px; font-size: 12px; text-decoration: none; }}
+  a.reviewing + a.with {{ display: none; }}
+  input.extra {{ box-sizing: border-box; width: 340px; max-width: 60vw;
+                 font: inherit; font-size: 12px; }}
   a.act {{ font-size: 12px; }}
   a.session {{ margin-left: 6px; font-weight: 600; color: #1a7f37; }}
+  a.effort {{ font-weight: 600; text-decoration: none; }}
+  a.effort.none, a.effort.stale {{ font-weight: normal; color: #59636e; }}
   .more {{ margin-top: 2px; }}
   a.chip {{ text-decoration: none; color: inherit; }}
   a.chip:hover {{ text-decoration: underline; }}
@@ -244,6 +262,9 @@ PAGE = """<!DOCTYPE html>
     <button type="submit" name="force" value="1"
             title="Fetch the latest tickets from Jira, then apply the filters">
       Fetch from Jira</button>
+    <button type="button" id="estimate-all"
+            title="Ask Claude for the fix effort of each ticket shown that has no estimate yet, one at a time; each one costs Claude usage">
+      Estimate effort</button>
     <a href="/" title="Back to the default filters">Defaults</a>
   </div>
 </form>
@@ -378,18 +399,91 @@ PAGE = """<!DOCTYPE html>
   // Code on a review of the ticket. It is greyed out, and does nothing,
   // for a ticket that a Claude Code session is already reviewing: one the
   // server found when it made the page, or one started from this page.
-  // Ask the server to do something on this computer; the answer is the
-  // error message, empty when it worked.
-  const post = async (path, key) => {{
+  // Ask the server to do something on this computer; the answer is what
+  // it sent back, with the message as "error" when it didn't work.
+  const ask = async (path, key, more = {{}}) => {{
     try {{
       const resp = await fetch(path, {{method: "POST",
-        body: new URLSearchParams({{key, token: "{token}"}})}});
-      return resp.ok ? (await resp.json()).error || ""
-                     : "The server refused; reload the page and try again.";
+        body: new URLSearchParams({{key, ...more, token: "{token}"}})}});
+      return resp.ok ? await resp.json()
+                     : {{error: "The server refused; reload the page and try again."}};
     }} catch (err) {{
-      return err.message;
+      return {{error: err.message}};
     }}
   }};
+  // The same, for just the error message, empty when it worked.
+  const post = async (path, key, more) => (await ask(path, key, more)).error || "";
+  // The effort cell: "?" asks Claude for the ticket's fix effort, and a
+  // score asks again once that is confirmed, since each estimate costs
+  // Claude usage. The server saves the estimate; the row's sort key
+  // follows it. Returns the error message, empty when it worked.
+  function showEffort(a, effort) {{
+    a.textContent = effort.score;
+    a.title = effort.why + " (click to estimate again)";
+    a.dataset.score = effort.score;
+    delete a.dataset.reviewed;
+    a.classList.remove("none", "stale");
+    a.closest("tr").dataset.sortEffort = effort.score;
+  }}
+  async function estimateEffort(a) {{
+    if (a.dataset.busy) return "";
+    a.dataset.busy = "1";
+    const was = a.textContent;
+    a.textContent = "...";
+    const effort = await ask("/effort", a.dataset.effort);
+    delete a.dataset.busy;
+    if (effort.error) {{
+      a.textContent = was;
+      return a.dataset.effort + ": " + effort.error;
+    }}
+    showEffort(a, effort);
+    return "";
+  }}
+  const effortLinks = () => Array.from(document.querySelectorAll("a.effort"));
+  effortLinks().forEach(a => a.addEventListener("click", async e => {{
+    e.preventDefault();
+    const again = "reviewed" in a.dataset
+      ? "Replace the effort from the review of " + a.dataset.effort + " with Claude's estimate from the ticket?"
+      : "Estimate " + a.dataset.effort + " again?";
+    if (a.dataset.score && !confirm(again)) return;
+    const error = await estimateEffort(a);
+    if (error) alert(error);
+  }}));
+  // After a fetch the server estimates the tickets that have no effort
+  // yet, by itself; while it does, fill in the "?" cells as they are done.
+  async function pollEfforts() {{
+    try {{
+      const now = await (await fetch("/efforts")).json();
+      effortLinks().filter(a => !a.dataset.score && !a.dataset.busy).forEach(a => {{
+        const effort = now.efforts[a.dataset.effort];
+        if (effort) showEffort(a, effort);
+      }});
+      if (now.running) setTimeout(pollEfforts, 4000);
+    }} catch (e) {{}}
+  }}
+  if (effortLinks().some(a => !a.dataset.score)) setTimeout(pollEfforts, 1500);
+  // "Estimate effort" does the tickets shown that have no estimate, one at
+  // a time in the order shown; a second click stops after the current one.
+  const estimateAll = document.getElementById("estimate-all");
+  estimateAll.hidden = !effortLinks().length;  // the column isn't shown
+  let estimating = false;
+  estimateAll.addEventListener("click", async () => {{
+    if (estimating) {{ estimating = false; return; }}
+    const todo = effortLinks().filter(a => !a.dataset.score);
+    if (!todo.length) {{ alert("Every ticket shown has an estimate."); return; }}
+    if (!confirm("Ask Claude to estimate " + todo.length + " ticket(s)?")) return;
+    const label = estimateAll.textContent;
+    estimating = true;
+    let done = 0;
+    for (const a of todo) {{
+      if (!estimating) break;
+      estimateAll.textContent = "Estimating " + (++done) + "/" + todo.length + " (click to stop)";
+      const error = await estimateEffort(a);
+      if (error) {{ alert(error); break; }}
+    }}
+    estimating = false;
+    estimateAll.textContent = label;
+  }});
   // The other small links: open the document on the ticket, or bring the
   // Terminal window of the session reviewing it to the front.
   document.querySelectorAll(".act").forEach(a => a.addEventListener("click", async e => {{
@@ -397,23 +491,51 @@ PAGE = """<!DOCTYPE html>
     const error = await post("/" + a.dataset.act, a.dataset.key);
     if (error) alert(error);
   }}));
+  // prompt is more instructions for the review, typed in the field that
+  // "+" opens; the server adds them to its own prompt.
+  const startReview = async (btn, prompt = "") => {{
+    if (btn.classList.contains("reviewing")) return;
+    const note = btn.parentNode.querySelector(".note");
+    note.textContent = "Opening...";
+    const error = await post("/review", btn.dataset.review, {{prompt}});
+    note.textContent = error ? "" : "Opened in Terminal";
+    if (error) {{
+      alert(error);
+    }} else {{
+      btn.classList.add("reviewing");
+      btn.title = "A Claude Code session is already reviewing this ticket";
+    }}
+    setTimeout(() => {{ note.textContent = ""; }}, 2500);
+  }};
   document.querySelectorAll(".review").forEach(btn => {{
-    btn.addEventListener("click", async e => {{
+    btn.addEventListener("click", e => {{
       e.preventDefault();
-      if (btn.classList.contains("reviewing")) return;
-      const note = btn.nextElementSibling;
-      note.textContent = "Opening...";
-      const error = await post("/review", btn.dataset.review);
-      note.textContent = error ? "" : "Opened in Terminal";
-      if (error) {{
-        alert(error);
-      }} else {{
-        btn.classList.add("reviewing");
-        btn.title = "A Claude Code session is already reviewing this ticket";
-      }}
-      setTimeout(() => {{ note.textContent = ""; }}, 2500);
+      startReview(btn);
     }});
   }});
+  // "+" opens a field under the links for the instructions: Enter starts
+  // the review with them, Escape or a second click on "+" puts it away.
+  document.querySelectorAll("a.with").forEach(a => a.addEventListener("click", e => {{
+    e.preventDefault();
+    const cell = a.parentNode;
+    const open = cell.querySelector("input.extra");
+    if (open) {{ open.parentNode.remove(); return; }}
+    const line = document.createElement("div");
+    line.className = "more";
+    const extra = document.createElement("input");
+    extra.type = "text";
+    extra.className = "extra";
+    extra.placeholder = "Extra instructions, then Enter";
+    extra.addEventListener("keydown", e => {{
+      if (e.key === "Escape") {{ e.stopPropagation(); line.remove(); }}
+      if (e.key !== "Enter") return;
+      line.remove();
+      startReview(a.previousElementSibling, extra.value);
+    }});
+    line.append(extra);
+    cell.querySelector(".note").after(line);
+    extra.focus();
+  }}));
   document.getElementById("modal-close").addEventListener("click", () => modal.hidden = true);
   modal.addEventListener("click", e => {{ if (e.target === modal) modal.hidden = true; }});
   document.addEventListener("keydown", e => {{
@@ -498,7 +620,8 @@ def review_links(row, state):
     a review of the ticket, and reads "resume" when there is a document on
     it; for a ticket that a Claude Code session is already on, "session"
     takes its place and brings that session's window to the front. Under
-    them, a link that opens the document and the ticket's open PRs."""
+    them, a link that opens the document and the ticket's open PRs, each
+    on a line of its own."""
     key = escape(row["key"])
     document = state["documents"].get(row["key"].upper())
     if row["key"].upper() in state["reviewing"]:
@@ -511,7 +634,10 @@ def review_links(row, state):
         review = (
             f'<a class="review" href="#" data-review="{key}" title="Open a'
             ' terminal and start a review of the ticket with Claude Code">'
-            f'{"resume" if document else "review"}</a><span class="note"></span>'
+            f'{"resume" if document else "review"}</a>'
+            '<a class="with" href="#" title="Type more instructions for the'
+            ' review first; they are added to the prompt it starts with">+</a>'
+            '<span class="note"></span>'
         )
     more = []
     if document:
@@ -525,11 +651,45 @@ def review_links(row, state):
         f' title="{escape(title)}">{escape(label)}</a>'
         for label, url, title in state["prs"].get(row["key"].upper(), [])
     ]
-    return review + (f'<div class="more">{" ".join(more)}</div>' if more else "")
+    return review + "".join(f'<div class="more">{line}</div>' for line in more)
+
+
+def effort_html(row):
+    """Return the effort cell: the saved effort to fix the ticket, 1 to 5
+    (see fix_effort.py), with the reason and where it came from when
+    hovered over, or "?" without one. Clicking either asks Claude for an
+    estimate; one made before the ticket last changed is greyed and marked
+    "?"."""
+    key = escape(row["key"])
+    effort = fix_effort.saved(row["key"])
+    if not effort:
+        return (
+            f'<a class="effort none" href="#" data-effort="{key}" title="No'
+            ' estimate of the work to fix this ticket yet; click to ask Claude'
+            ' for one (costs Claude usage)">?</a>'
+        )
+    old = fix_effort.stale(row, effort)
+    if fix_effort.reviewed(effort):
+        note = (f" (from the review of the ticket, {effort['updated']};"
+                " click to have Claude estimate it from the ticket instead)")
+    elif old:
+        note = (f" The ticket changed on {row['updated']}, after this"
+                " estimate; click to estimate again.")
+    else:
+        note = " (click to estimate again)"
+    return (
+        f'<a class="effort{" stale" if old else ""}" href="#"'
+        f' data-effort="{key}" data-score="{effort["score"]}"'
+        f'{" data-reviewed" if fix_effort.reviewed(effort) else ""}'
+        f' title="{escape(effort["why"] + note)}">'
+        f'{effort["score"]}{"?" if old else ""}</a>'
+    )
 
 
 def cell_html(row, column, state):
     """Return a cell's HTML; state is page_state()'s."""
+    if column == "effort":
+        return effort_html(row)
     if column == "ticket":
         return (
             f'<a class="key open" href="{escape(row["url"])}"'
@@ -564,18 +724,21 @@ def cell_html(row, column, state):
     return escape(digest.cell_text(row, column))
 
 
-NOWRAP = {"ticket", "assignee", "status", "severity", "parent", "created", "updated", "priority", "type", "project"}
+NOWRAP = {"ticket", "assignee", "status", "severity", "effort", "parent", "created", "updated", "priority", "type", "project"}
 
 
-SORTABLE = ["ticket", "status", "severity", "priority"]
+SORTABLE = ["ticket", "status", "severity", "priority", "effort"]
 
 
 def sort_keys(row):
     """The data attributes the page's column sorting compares as strings:
-    tickets by project and then number, statuses by name, and severities
-    and priorities so that a bigger key is more severe or higher."""
+    tickets by project and then number, statuses by name, severities and
+    priorities so that a bigger key is more severe or higher, and efforts
+    by score, with the tickets that have none as 0."""
     project, number = row["key"].rsplit("-", 1)
+    effort = fix_effort.saved(row["key"])
     return (
+        f' data-sort-effort="{effort["score"] if effort else 0}"'
         f' data-sort-ticket="{escape(project)}-{int(number):06d}"'
         f' data-sort-status="{escape(row["status"].lower())}"'
         f' data-sort-severity="{9 - digest.severity_rank(row["severity"])}"'
@@ -631,6 +794,10 @@ def ticket_html(row):
         ("Components", ", ".join(row["components"])),
         ("Resolution", row["resolution"]),
     ]
+    effort = fix_effort.saved(row["key"])
+    if effort:
+        # As it was when the page was made; the table cell has the latest.
+        facts.append(("Fix effort", f'{fix_effort.label(row)}: {effort["why"]}'))
     dl = "".join(
         f"<dt>{escape(k)}</dt><dd>{escape(v)}</dd>" for k, v in facts if v
     )
@@ -676,6 +843,58 @@ def ticket_summary_of(key, data):
         return {"error": str(e)}
 
 
+def estimate_effort(form):
+    """Ask Claude for the fix effort of the ticket the form names, save it,
+    and return it as {"score", "why", "updated"}; see fix_effort.py. Raises
+    RuntimeError when the ticket isn't loaded or Claude can't be asked."""
+    key = first(form, "key")
+    tickets = (Handler.data or {}).get("tickets", [])
+    row = next((t for t in tickets if t["key"] == key), None)
+    if row is None:
+        raise RuntimeError(f"{key} isn't among the loaded tickets; reload the page.")
+    return fix_effort.estimate(row)
+
+
+def estimate_ahead(data):
+    """Estimate the fix effort of the tickets on the default page (the
+    default filters) that have none saved, so that the Effort column is
+    filled in without asking. Each ticket is done once: a saved effort,
+    from an estimate or a review, is left alone, also when the ticket
+    changed since. Runs in its own thread, one ticket at a time, and gives
+    up after AHEAD_FAILURES failures in a row (Claude missing or out of
+    usage, say); the next fetch tries again."""
+    if not AHEAD_LOCK.acquire(blocking=False):
+        return
+    try:
+        _, rows = digest.select_rows(data, filter_args({}))
+        failures = 0
+        for row in rows:
+            if fix_effort.saved(row["key"]):
+                continue
+            try:
+                fix_effort.estimate(row)
+                failures = 0
+            except RuntimeError as e:
+                print(f"effort of {row['key']}: {e}", file=sys.stderr)
+                failures += 1
+                if failures == AHEAD_FAILURES:
+                    return
+    finally:
+        AHEAD_LOCK.release()
+
+
+def efforts_now():
+    """Return the saved efforts and whether estimate_ahead() is at work,
+    for the page to fill in its "?" cells while it is."""
+    return {
+        "running": AHEAD_LOCK.locked(),
+        "efforts": {
+            key: {"score": e["score"], "why": e["why"]}
+            for key, e in fix_effort.read_saved().items()
+        },
+    }
+
+
 def tickets_in_review(listing=None):
     """Return {ticket key: process id} for the tickets that a running Claude
     Code session was started on: the ticket keys in the command lines of
@@ -698,6 +917,9 @@ def tickets_in_review(listing=None):
         program, _, arguments = command.strip().partition(" ")
         # The program is "claude" or the full path of the claude program.
         if pid.isdigit() and Path(program).name == "claude":
+            # Not the keys in the instructions typed on the page: a ticket
+            # they mention isn't the one in review.
+            arguments = arguments.partition(EXTRA_LEAD)[0]
             for key in TICKET_KEY.findall(arguments):
                 keys.setdefault(key.upper(), int(pid))
     return keys
@@ -768,8 +990,28 @@ def page_state():
 
 def start_review(form):
     """Start a review of the ticket the form names in an idle Terminal tab,
-    or a new Terminal window when there is none."""
-    open_terminal(review_command(first(form, "key")))
+    or a new Terminal window when there is none, with the instructions
+    typed on the page, if any, added to the prompt."""
+    open_terminal(review_command(first(form, "key"), first(form, "prompt")))
+
+
+# What comes before the instructions typed on the page, in the prompt of a
+# review; tickets_in_review() reads the command line up to it.
+EXTRA_LEAD = " Additional instructions: "
+# The longest instructions "review" takes from the page, in characters.
+EXTRA_PROMPT_MAX = 4000
+
+
+def extra_instructions(text):
+    """Return the instructions typed on the page for a review as one line
+    of printable text, to add to the prompt: the command is typed into a
+    terminal, where a line break or a control character would do something
+    else. Raises RuntimeError when they are too long."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    if len(text) > EXTRA_PROMPT_MAX:
+        raise RuntimeError(f"The instructions are {len(text)} characters long;"
+                           f" at most {EXTRA_PROMPT_MAX} fit.")
+    return text
 
 
 def focus_session(form):
@@ -815,9 +1057,11 @@ def open_document(form):
         raise RuntimeError(f"Opening {document} failed: {e}") from e
 
 
-def review_command(key):
+def review_command(key, extra=""):
     """Return the shell command that "review" runs for a ticket: go to the
-    review directory and start Claude Code on a review of the ticket. Raises
+    review directory and start Claude Code on a review of the ticket. extra
+    is more instructions for the review, typed on the page; they follow
+    the prompt. Raises
     RuntimeError when the key isn't a ticket key, the directory is missing,
     or a Claude Code session is already reviewing the ticket (the page
     greys out "review" for those, but may be out of date)."""
@@ -833,8 +1077,15 @@ def review_command(key):
     prompt = (
         f"Review Jira ticket {key}. If a document on this ticket already"
         f" exists here ({key.replace('-', '')} or {key} in its name), resume"
-        " from it instead of starting over."
+        " from it instead of starting over. When you know how much work the"
+        " fix is, record it for the Jira digest page: run python3"
+        f" {shlex.quote(str(EFFORT_SCRIPT))} {key} SCORE 'one sentence on"
+        " why', with SCORE from 1 to 5 (--help prints the scale), and run it"
+        " again if your assessment changes."
     )
+    extra = extra_instructions(extra)
+    if extra:
+        prompt += EXTRA_LEAD + extra
     return f"cd {shlex.quote(str(REVIEW_DIR))} && claude {shlex.quote(prompt)}"
 
 
@@ -1019,12 +1270,16 @@ class Handler(BaseHTTPRequestHandler):
     data = None  # the last ticket data loaded
     users = []  # the last list of assignable people loaded
     lock = threading.Lock()  # one fetch at a time
+    ahead_for = None  # the fetch that estimate_ahead() was last started for
 
     def do_GET(self):
         url = urlparse(self.path)
         query = parse_qs(url.query)
         if url.path == "/summary":
-            self.send_summary(first(query, "key"))
+            self.send_json(ticket_summary_of(first(query, "key"), Handler.data))
+            return
+        if url.path == "/efforts":
+            self.send_json(efforts_now())
             return
         if url.path != "/":
             self.send_error(404)
@@ -1054,12 +1309,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Do one of the things the page's links do on this computer: start
         a review in a Terminal window, bring a session's window to the
-        front, or open a document. Only this server's own page may ask: the
+        front, open a document, or ask Claude for a ticket's fix effort
+        (answered with the estimate). Only this server's own page may ask: the
         request must be addressed to this server by its local name and
         carry the token the page was given, so no other web page can make
         the server run anything."""
         actions = {"/review": start_review, "/focus": focus_session,
-                   "/open": open_document}
+                   "/open": open_document, "/effort": estimate_effort}
         length = int(self.headers.get("Content-Length") or 0)
         form = parse_qs(self.rfile.read(length).decode(errors="replace"))
         port = self.server.server_port
@@ -1072,8 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         try:
-            action(form)
-            result = {}
+            result = action(form) or {}
         except RuntimeError as e:
             result = {"error": str(e)}
         body = json.dumps(result).encode()
@@ -1083,10 +1338,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_summary(self, key):
-        """Answer the preview's request for a ticket's summary with JSON:
-        {"title", "text"}, or {"error"} when there is none to give."""
-        body = json.dumps(ticket_summary_of(key, Handler.data)).encode()
+    def send_json(self, answer):
+        """Answer one of the page's requests for data with JSON: a ticket's
+        summary ({"title", "text"}, or {"error"} when there is none to
+        give), or the saved efforts."""
+        body = json.dumps(answer).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1103,6 +1359,13 @@ class Handler(BaseHTTPRequestHandler):
                 Handler.data = digest.load_data(
                     Handler.auth, force, args.assignee, args.created
                 )
+                # Once for each fetch from Jira, not for each page shown.
+                fetched = digest.CACHE_FILE.stat().st_mtime
+                if EFFORT_AUTO and fetched != Handler.ahead_for:
+                    Handler.ahead_for = fetched
+                    threading.Thread(
+                        target=estimate_ahead, args=(Handler.data,), daemon=True,
+                    ).start()
             except Exception as e:  # show any fetch failure on the page
                 errors.append(f"Fetching from Jira failed: {e}")
             try:
