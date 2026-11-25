@@ -58,6 +58,14 @@ JIRA_REVIEW_DIR is the directory the web page's "review" link starts Claude
 Code in. The default is Documents/Reports-CodeReview next to this project's
 directory.
 
+  export JIRA_DOCS_DIR="$HOME/reviews"
+
+JIRA_DOCS_DIR is the directory your documents on tickets are kept in, at
+any depth: a ticket's is a Markdown file with the key in its name, with or
+without the hyphen (PROJ123-analysis.md), or in a directory named so.
+Directories named "cache" are skipped. The default is Documents next to
+this project's directory.
+
 JIRA_SEVERITY_FIELDS lists the custom field ids that hold a ticket's
 severity, when your site has such a field (Jira sites often have several
 fields named "Severity"; list the ones your projects use, and the first one
@@ -206,7 +214,19 @@ for a ticket that a running Claude Code session was started on this way
 (the ticket key is in the session's command line), so that a ticket isn't
 reviewed twice at once; reload the page after closing the session. A
 session that was started without the key and took up the ticket later
-isn't noticed.
+isn't noticed. For a ticket with such a session, "session" takes the place
+of "review"; click it to bring the session's Terminal window to the front.
+
+"review" reads "resume" for a ticket you have a document on, and "notes"
+with a date under the key opens that document (the newest when there are
+several, and the date it was last changed); see JIRA_DOCS_DIR above. Next
+to it are the ticket's open PRs, each a link to the PR on GitHub: the PRs
+that name the ticket in their title or branch, or link to it in their
+description. They come from the PRs that pr-review-digest, a sibling
+project, has fetched and saved (~/.cache/pr-review-digest/prs.json), so
+they are as fresh as its last fetch, and absent without it.
+
+None of this uses Claude: only the preview's summary does, once per ticket.
 
 The preview starts with a summary: a few sentences on what the ticket is
 about, written by the claude command (Claude Code,

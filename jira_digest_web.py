@@ -48,7 +48,42 @@ REVIEW_DIR = Path(
     or Path(__file__).resolve().parent.parent / "Documents" / "Reports-CodeReview"
 ).expanduser()
 
-# Given to the page and required back by /review; see do_POST.
+# Where the documents on tickets are kept, in this directory or any below
+# it: a ticket's is a Markdown file with the key in its name, with or
+# without the hyphen (PROJ123-analysis.md).
+DOCS_DIR = Path(
+    os.environ.get("JIRA_DOCS_DIR")
+    or Path(__file__).resolve().parent.parent / "Documents"
+).expanduser()
+# A ticket key in a file name, PR title, or branch: PROJ-123 or PROJ123.
+DOCUMENT_KEY = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,})-?(\d+)(?!\d)")
+# A ticket key in a link to the ticket.
+BROWSE_KEY = re.compile(r"/browse/([A-Za-z][A-Za-z0-9]+)-(\d+)")
+# The open PRs that pr-review-digest (a sibling project) has fetched and
+# saved; a ticket's PRs are shown from there.
+PR_CACHE_FILE = Path.home() / ".cache" / "pr-review-digest" / "prs.json"
+
+# AppleScript: select the Terminal tab on the given tty and bring its window
+# to the front; prints "found" when there is one.
+FOCUS_SCRIPT = [
+    "on run argv",
+    'tell application "Terminal"',
+    "repeat with w in windows",
+    "repeat with t in tabs of w",
+    "if (tty of t) is in argv then",
+    "set selected of t to true",
+    "set index of w to 1",
+    "activate",
+    'return "found"',
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end tell",
+    'return ""',
+    "end run",
+]
+
+# Given to the page and required back by its links; see do_POST.
 TOKEN = secrets.token_urlsafe()
 
 PAGE = """<!DOCTYPE html>
@@ -99,6 +134,11 @@ PAGE = """<!DOCTYPE html>
   a.jira {{ margin-left: 4px; text-decoration: none; font-size: 12px; }}
   a.review {{ margin-left: 6px; font-size: 12px; }}
   a.reviewing {{ color: #afb8c1; cursor: default; text-decoration: none; }}
+  a.act {{ font-size: 12px; }}
+  a.session {{ margin-left: 6px; font-weight: 600; color: #1a7f37; }}
+  .more {{ margin-top: 2px; }}
+  a.chip {{ text-decoration: none; color: inherit; }}
+  a.chip:hover {{ text-decoration: underline; }}
   .note {{ color: #1a7f37; font-size: 12px; margin-left: 4px; }}
   a.title {{ color: inherit; text-decoration: none; }}
   a.title:hover {{ text-decoration: underline dotted; }}
@@ -338,21 +378,32 @@ PAGE = """<!DOCTYPE html>
   // Code on a review of the ticket. It is greyed out, and does nothing,
   // for a ticket that a Claude Code session is already reviewing: one the
   // server found when it made the page, or one started from this page.
+  // Ask the server to do something on this computer; the answer is the
+  // error message, empty when it worked.
+  const post = async (path, key) => {{
+    try {{
+      const resp = await fetch(path, {{method: "POST",
+        body: new URLSearchParams({{key, token: "{token}"}})}});
+      return resp.ok ? (await resp.json()).error || ""
+                     : "The server refused; reload the page and try again.";
+    }} catch (err) {{
+      return err.message;
+    }}
+  }};
+  // The other small links: open the document on the ticket, or bring the
+  // Terminal window of the session reviewing it to the front.
+  document.querySelectorAll(".act").forEach(a => a.addEventListener("click", async e => {{
+    e.preventDefault();
+    const error = await post("/" + a.dataset.act, a.dataset.key);
+    if (error) alert(error);
+  }}));
   document.querySelectorAll(".review").forEach(btn => {{
     btn.addEventListener("click", async e => {{
       e.preventDefault();
       if (btn.classList.contains("reviewing")) return;
       const note = btn.nextElementSibling;
       note.textContent = "Opening...";
-      let error = "";
-      try {{
-        const resp = await fetch("/review", {{method: "POST",
-          body: new URLSearchParams({{key: btn.dataset.review, token: "{token}"}})}});
-        error = resp.ok ? (await resp.json()).error
-                        : "The server refused; reload the page and try again.";
-      }} catch (err) {{
-        error = err.message;
-      }}
+      const error = await post("/review", btn.dataset.review);
       note.textContent = error ? "" : "Opened in Terminal";
       if (error) {{
         alert(error);
@@ -442,23 +493,50 @@ def severity_html(severity):
     return f'<span class="sev-{escape(severity.lower())}">{escape(severity)}</span>'
 
 
-def cell_html(row, column, reviewing=()):
-    """Return a cell's HTML. reviewing holds the keys of the tickets that a
-    Claude Code session is already reviewing; their "review" is greyed out."""
+def review_links(row, state):
+    """Return what follows a ticket's key and preview icon. "review" starts
+    a review of the ticket, and reads "resume" when there is a document on
+    it; for a ticket that a Claude Code session is already on, "session"
+    takes its place and brings that session's window to the front. Under
+    them, a link that opens the document and the ticket's open PRs."""
+    key = escape(row["key"])
+    document = state["documents"].get(row["key"].upper())
+    if row["key"].upper() in state["reviewing"]:
+        review = (
+            f'<a class="act session" href="#" data-act="focus" data-key="{key}"'
+            ' title="A Claude Code session is reviewing this ticket; click to'
+            ' bring its Terminal window to the front">session</a>'
+        )
+    else:
+        review = (
+            f'<a class="review" href="#" data-review="{key}" title="Open a'
+            ' terminal and start a review of the ticket with Claude Code">'
+            f'{"resume" if document else "review"}</a><span class="note"></span>'
+        )
+    more = []
+    if document:
+        when = time.strftime("%m-%d", time.localtime(document.stat().st_mtime))
+        more.append(
+            f'<a class="act" href="#" data-act="open" data-key="{key}"'
+            f' title="Open {escape(document.name)}">notes {when}</a>'
+        )
+    more += [
+        f'<a class="chip" href="{escape(url)}" target="_blank" rel="noopener"'
+        f' title="{escape(title)}">{escape(label)}</a>'
+        for label, url, title in state["prs"].get(row["key"].upper(), [])
+    ]
+    return review + (f'<div class="more">{" ".join(more)}</div>' if more else "")
+
+
+def cell_html(row, column, state):
+    """Return a cell's HTML; state is page_state()'s."""
     if column == "ticket":
-        if row["key"].upper() in reviewing:
-            review = (' reviewing" title="A Claude Code session is already'
-                      ' reviewing this ticket')
-        else:
-            review = ('" title="Open a terminal and start a review of the'
-                      " ticket with Claude Code")
         return (
             f'<a class="key open" href="{escape(row["url"])}"'
             f' title="Open the ticket in Jira in a separate window">{escape(row["key"])}</a>'
             f'<a class="jira" href="#" data-key="{escape(row["key"])}"'
             f' title="Quick read-only preview">&#9432;</a>'
-            f'<a class="review{review}" href="#" data-review="{escape(row["key"])}">'
-            'review</a><span class="note"></span>'
+            f"{review_links(row, state)}"
         )
     if column == "title":
         return (
@@ -522,12 +600,12 @@ def header_html(column):
 def table_rows(rows, columns):
     if not rows:
         return f'<tr><td colspan="{len(columns)}">No tickets match these filters.</td></tr>'
-    reviewing = tickets_in_review()
+    state = page_state()
     return "\n".join(
         f"<tr{sort_keys(r)}>"
         + "".join(
             f'<td class="{"nowrap" if c in NOWRAP else ""}">'
-            f"{cell_html(r, c, reviewing)}</td>"
+            f"{cell_html(r, c, state)}</td>"
             for c in columns
         )
         + "</tr>"
@@ -599,27 +677,141 @@ def ticket_summary_of(key, data):
 
 
 def tickets_in_review(listing=None):
-    """Return the keys of the tickets that a running Claude Code session was
-    started on: the ticket keys in the command lines of the claude
-    processes, which is where "review" puts the key. A session that was
-    started without the key and took up the ticket later isn't seen.
-    listing is the output of ps, one command line per line; left out, ps is
-    run, and when that fails no ticket counts as in review."""
+    """Return {ticket key: process id} for the tickets that a running Claude
+    Code session was started on: the ticket keys in the command lines of
+    the claude processes, which is where "review" puts the key. A session
+    that was started without the key and took up the ticket later isn't
+    seen. listing is the output of ps, a process id and command line per
+    line; left out, ps is run, and when that fails no ticket counts as in
+    review."""
     if listing is None:
         try:
             listing = subprocess.run(
-                ["ps", "-axo", "args="], capture_output=True, text=True,
+                ["ps", "-axo", "pid=,args="], capture_output=True, text=True,
                 timeout=10,
             ).stdout
         except (OSError, subprocess.SubprocessError):
-            return set()
-    keys = set()
+            return {}
+    keys = {}
     for line in listing.splitlines():
-        program, _, arguments = line.strip().partition(" ")
+        pid, _, command = line.strip().partition(" ")
+        program, _, arguments = command.strip().partition(" ")
         # The program is "claude" or the full path of the claude program.
-        if Path(program).name == "claude":
-            keys.update(k.upper() for k in TICKET_KEY.findall(arguments))
+        if pid.isdigit() and Path(program).name == "claude":
+            for key in TICKET_KEY.findall(arguments):
+                keys.setdefault(key.upper(), int(pid))
     return keys
+
+
+def ticket_documents():
+    """Return {ticket key: the document on it}: the Markdown files under
+    DOCS_DIR with the key in their names, with or without the hyphen
+    (PROJ123-analysis.md), or in a directory with the key in its name; the
+    newest when a ticket has several."""
+    found = {}
+    for root, dirs, files in os.walk(DOCS_DIR):
+        # Not the hidden directories, nor a cache: a tool's saved copies of
+        # the tickets carry the keys in their names too.
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() != "cache"]
+        above = DOCUMENT_KEY.findall(Path(root).name)
+        for name in files:
+            if not name.endswith(".md"):
+                continue
+            path = Path(root, name)
+            for project, number in DOCUMENT_KEY.findall(name) + above:
+                key = f"{project.upper()}-{number}"
+                try:
+                    older = found.get(key)
+                    if not older or older.stat().st_mtime < path.stat().st_mtime:
+                        found[key] = path
+                except OSError:
+                    pass
+    return found
+
+
+def ticket_prs():
+    """Return {ticket key: [(PR label, URL, title)]} for the open PRs that
+    name a ticket in their title or branch (with or without the hyphen) or
+    link to it in their description, from the PRs that pr-review-digest, a
+    sibling project, has fetched and saved. Empty when it has saved none.
+    The file is read again only when it has changed."""
+    try:
+        changed = PR_CACHE_FILE.stat().st_mtime
+        if changed != ticket_prs.read:
+            found = {}
+            for prs in json.loads(PR_CACHE_FILE.read_text())["prs"].values():
+                for pr in prs:
+                    named = DOCUMENT_KEY.findall(f"{pr['title']} {pr['headRefName']}")
+                    named += BROWSE_KEY.findall(pr.get("body") or "")
+                    entry = (f"{pr['repo']}#{pr['number']}", pr["url"], pr["title"])
+                    for project, number in dict.fromkeys(named):
+                        found.setdefault(f"{project.upper()}-{number}", []).append(entry)
+            ticket_prs.found, ticket_prs.read = found, changed
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    return ticket_prs.found
+
+
+ticket_prs.found, ticket_prs.read = {}, None
+
+
+def page_state():
+    """Return what the ticket cells show besides the ticket data, worked
+    out once per page: "reviewing" (tickets_in_review), "documents"
+    (ticket_documents), and "prs" (ticket_prs)."""
+    return {
+        "reviewing": tickets_in_review(),
+        "documents": ticket_documents(),
+        "prs": ticket_prs(),
+    }
+
+
+def start_review(form):
+    """Open a Terminal window that reviews the ticket the form names."""
+    open_terminal(review_command(first(form, "key")))
+
+
+def focus_session(form):
+    """Bring to the front the Terminal window of the Claude Code session
+    that is reviewing the ticket the form names. Raises RuntimeError when
+    there is no such session or window."""
+    key = first(form, "key").upper()
+    pid = tickets_in_review().get(key)
+    if not pid:
+        raise RuntimeError(f"No Claude Code session is reviewing {key} any"
+                           " more; reload the page.")
+    args = ["osascript"]
+    for line in FOCUS_SCRIPT:
+        args += ["-e", line]
+    try:
+        tty = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        found = tty not in ("", "??") and subprocess.run(
+            args + [f"/dev/{tty}"], check=True, capture_output=True, text=True,
+            timeout=60,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"Asking Terminal for its windows failed: {e}") from e
+    if not found:
+        raise RuntimeError("The session isn't in a Terminal window; it may be"
+                           " running in an editor or another terminal program.")
+
+
+def open_document(form):
+    """Open the document on the ticket the form names, in the program that
+    opens Markdown files. Raises RuntimeError when there is none."""
+    key = first(form, "key").upper()
+    document = ticket_documents().get(key)
+    if not document:
+        raise RuntimeError(f"No document on {key} under {DOCS_DIR} any more;"
+                           " reload the page.")
+    try:
+        subprocess.run(["open", str(document)], check=True, capture_output=True,
+                       text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"Opening {document} failed: {e}") from e
 
 
 def review_command(key):
@@ -834,22 +1026,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        """Start a review in a new Terminal window. Only this server's own
-        page may ask: the request must be addressed to this server by its
-        local name and carry the token the page was given, so no other web
-        page can make the server run anything."""
+        """Do one of the things the page's links do on this computer: start
+        a review in a new Terminal window, bring a session's window to the
+        front, or open a document. Only this server's own page may ask: the
+        request must be addressed to this server by its local name and
+        carry the token the page was given, so no other web page can make
+        the server run anything."""
+        actions = {"/review": start_review, "/focus": focus_session,
+                   "/open": open_document}
         length = int(self.headers.get("Content-Length") or 0)
         form = parse_qs(self.rfile.read(length).decode(errors="replace"))
         port = self.server.server_port
+        action = actions.get(urlparse(self.path).path)
         if (
-            urlparse(self.path).path != "/review"
+            not action
             or self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}")
             or not secrets.compare_digest(first(form, "token"), TOKEN)
         ):
             self.send_error(403)
             return
         try:
-            open_terminal(review_command(first(form, "key")))
+            action(form)
             result = {}
         except RuntimeError as e:
             result = {"error": str(e)}
