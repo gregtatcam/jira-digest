@@ -52,6 +52,11 @@ Optional:
 
   export JIRA_SEVERITY_FIELDS='customfield_12345,customfield_23456'
   export JIRA_NOT_LABELS='FalsePositive'
+  export JIRA_REVIEW_DIR="$HOME/reviews"
+
+JIRA_REVIEW_DIR is the directory the web page's "review" link starts Claude
+Code in. The default is Documents/Reports-CodeReview next to this project's
+directory.
 
 JIRA_SEVERITY_FIELDS lists the custom field ids that hold a ticket's
 severity, when your site has such a field (Jira sites often have several
@@ -190,6 +195,18 @@ possible.)
 The small (i) icon next to the key shows a read-only preview in the page,
 from the cached data: the ticket's fields, description, and comments.
 Close it with the Close button, Escape, or a click outside it.
+
+"review" next to the key starts a review of the ticket with Claude Code:
+it opens a new Terminal window (macOS only), goes to JIRA_REVIEW_DIR, and
+runs claude with the prompt "Review Jira ticket PROJ-123", which also asks
+it to resume from a document on the ticket that is already there (one with
+PROJ123 or PROJ-123 in its name) rather than start over. The first time,
+macOS may ask to let the server control Terminal. "review" is greyed out
+for a ticket that a running Claude Code session was started on this way
+(the ticket key is in the session's command line), so that a ticket isn't
+reviewed twice at once; reload the page after closing the session. A
+session that was started without the key and took up the ticket later
+isn't noticed.
 
 The preview starts with a summary: a few sentences on what the ticket is
 about, written by the claude command (Claude Code,

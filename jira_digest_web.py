@@ -13,18 +13,25 @@ old.
 
 Environment: the same variables as jira_digest.py (JIRA_URL, JIRA_EMAIL,
 JIRA_TOKEN, JIRA_PROJECTS, and the optional JIRA_SEVERITY_FIELDS and
-JIRA_NOT_LABELS); see README.txt.
+JIRA_NOT_LABELS); see README.txt. The "review" link needs macOS and the
+claude command (Claude Code); JIRA_REVIEW_DIR names the directory the review
+starts in.
 """
 
 import argparse
 import json
+import os
 import re
+import secrets
+import shlex
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import jira_digest as digest
@@ -32,6 +39,17 @@ import ticket_summary
 
 SCRIPT_TAG = re.compile(r"<script\b.*?</script>", re.DOTALL | re.IGNORECASE)
 RELATIVE_URL = re.compile(r'\b(href|src)="/')
+TICKET_KEY = re.compile(r"[A-Za-z][A-Za-z0-9]+-\d+")
+
+# The directory "review" starts Claude Code in, where the review documents
+# are kept.
+REVIEW_DIR = Path(
+    os.environ.get("JIRA_REVIEW_DIR")
+    or Path(__file__).resolve().parent.parent / "Documents" / "Reports-CodeReview"
+).expanduser()
+
+# Given to the page and required back by /review; see do_POST.
+TOKEN = secrets.token_urlsafe()
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -79,6 +97,9 @@ PAGE = """<!DOCTYPE html>
   .nowrap {{ white-space: nowrap; }}
   a.key {{ font-weight: 600; }}
   a.jira {{ margin-left: 4px; text-decoration: none; font-size: 12px; }}
+  a.review {{ margin-left: 6px; font-size: 12px; }}
+  a.reviewing {{ color: #afb8c1; cursor: default; text-decoration: none; }}
+  .note {{ color: #1a7f37; font-size: 12px; margin-left: 4px; }}
   a.title {{ color: inherit; text-decoration: none; }}
   a.title:hover {{ text-decoration: underline dotted; }}
   .chip {{ display: inline-block; background: #eaeef2; border-radius: 10px;
@@ -313,6 +334,35 @@ PAGE = """<!DOCTYPE html>
   // The preview icon shows the cached, read-only copy without leaving the page.
   document.querySelectorAll("[data-key]").forEach(el =>
     el.addEventListener("click", e => {{ e.preventDefault(); openTicket(el.dataset.key); }}));
+  // "review" asks the server to open a Terminal window that starts Claude
+  // Code on a review of the ticket. It is greyed out, and does nothing,
+  // for a ticket that a Claude Code session is already reviewing: one the
+  // server found when it made the page, or one started from this page.
+  document.querySelectorAll(".review").forEach(btn => {{
+    btn.addEventListener("click", async e => {{
+      e.preventDefault();
+      if (btn.classList.contains("reviewing")) return;
+      const note = btn.nextElementSibling;
+      note.textContent = "Opening...";
+      let error = "";
+      try {{
+        const resp = await fetch("/review", {{method: "POST",
+          body: new URLSearchParams({{key: btn.dataset.review, token: "{token}"}})}});
+        error = resp.ok ? (await resp.json()).error
+                        : "The server refused; reload the page and try again.";
+      }} catch (err) {{
+        error = err.message;
+      }}
+      note.textContent = error ? "" : "Opened in Terminal";
+      if (error) {{
+        alert(error);
+      }} else {{
+        btn.classList.add("reviewing");
+        btn.title = "A Claude Code session is already reviewing this ticket";
+      }}
+      setTimeout(() => {{ note.textContent = ""; }}, 2500);
+    }});
+  }});
   document.getElementById("modal-close").addEventListener("click", () => modal.hidden = true);
   modal.addEventListener("click", e => {{ if (e.target === modal) modal.hidden = true; }});
   document.addEventListener("keydown", e => {{
@@ -392,13 +442,23 @@ def severity_html(severity):
     return f'<span class="sev-{escape(severity.lower())}">{escape(severity)}</span>'
 
 
-def cell_html(row, column):
+def cell_html(row, column, reviewing=()):
+    """Return a cell's HTML. reviewing holds the keys of the tickets that a
+    Claude Code session is already reviewing; their "review" is greyed out."""
     if column == "ticket":
+        if row["key"].upper() in reviewing:
+            review = (' reviewing" title="A Claude Code session is already'
+                      ' reviewing this ticket')
+        else:
+            review = ('" title="Open a terminal and start a review of the'
+                      " ticket with Claude Code")
         return (
             f'<a class="key open" href="{escape(row["url"])}"'
             f' title="Open the ticket in Jira in a separate window">{escape(row["key"])}</a>'
             f'<a class="jira" href="#" data-key="{escape(row["key"])}"'
             f' title="Quick read-only preview">&#9432;</a>'
+            f'<a class="review{review}" href="#" data-review="{escape(row["key"])}">'
+            'review</a><span class="note"></span>'
         )
     if column == "title":
         return (
@@ -462,10 +522,12 @@ def header_html(column):
 def table_rows(rows, columns):
     if not rows:
         return f'<tr><td colspan="{len(columns)}">No tickets match these filters.</td></tr>'
+    reviewing = tickets_in_review()
     return "\n".join(
         f"<tr{sort_keys(r)}>"
         + "".join(
-            f'<td class="{"nowrap" if c in NOWRAP else ""}">{cell_html(r, c)}</td>'
+            f'<td class="{"nowrap" if c in NOWRAP else ""}">'
+            f"{cell_html(r, c, reviewing)}</td>"
             for c in columns
         )
         + "</tr>"
@@ -534,6 +596,81 @@ def ticket_summary_of(key, data):
         )
     except RuntimeError as e:
         return {"error": str(e)}
+
+
+def tickets_in_review(listing=None):
+    """Return the keys of the tickets that a running Claude Code session was
+    started on: the ticket keys in the command lines of the claude
+    processes, which is where "review" puts the key. A session that was
+    started without the key and took up the ticket later isn't seen.
+    listing is the output of ps, one command line per line; left out, ps is
+    run, and when that fails no ticket counts as in review."""
+    if listing is None:
+        try:
+            listing = subprocess.run(
+                ["ps", "-axo", "args="], capture_output=True, text=True,
+                timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return set()
+    keys = set()
+    for line in listing.splitlines():
+        program, _, arguments = line.strip().partition(" ")
+        # The program is "claude" or the full path of the claude program.
+        if Path(program).name == "claude":
+            keys.update(k.upper() for k in TICKET_KEY.findall(arguments))
+    return keys
+
+
+def review_command(key):
+    """Return the shell command that "review" runs for a ticket: go to the
+    review directory and start Claude Code on a review of the ticket. Raises
+    RuntimeError when the key isn't a ticket key, the directory is missing,
+    or a Claude Code session is already reviewing the ticket (the page
+    greys out "review" for those, but may be out of date)."""
+    if not TICKET_KEY.fullmatch(key):
+        raise RuntimeError(f"{key!r} isn't a ticket key.")
+    if not REVIEW_DIR.is_dir():
+        raise RuntimeError(f"{REVIEW_DIR} doesn't exist; set JIRA_REVIEW_DIR,"
+                           " see README.txt.")
+    if key.upper() in tickets_in_review():
+        raise RuntimeError(f"A Claude Code session is already reviewing {key};"
+                           " a second one wasn't started.")
+    # A document's name has the key with or without the hyphen (PROJ123).
+    prompt = (
+        f"Review Jira ticket {key}. If a document on this ticket already"
+        f" exists here ({key.replace('-', '')} or {key} in its name), resume"
+        " from it instead of starting over."
+    )
+    return f"cd {shlex.quote(str(REVIEW_DIR))} && claude {shlex.quote(prompt)}"
+
+
+def open_terminal(command):
+    """Open a new Terminal window and run the shell command in it. The
+    command is handed to AppleScript as an argument, so it needs no quoting
+    beyond the shell's own. Raises RuntimeError when the window can't be
+    opened."""
+    script = [
+        "on run argv",
+        'tell application "Terminal"',
+        "activate",
+        "do script (item 1 of argv)",
+        "end tell",
+        "end run",
+    ]
+    args = ["osascript"]
+    for line in script:
+        args += ["-e", line]
+    try:
+        subprocess.run(args + [command], check=True, capture_output=True,
+                       text=True, timeout=60)
+    except FileNotFoundError as e:
+        raise RuntimeError("Opening a terminal needs macOS (osascript).") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("Terminal didn't answer; check for a macOS"
+                           " permission prompt.") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Opening Terminal failed: {e.stderr.strip()}") from e
 
 
 def boxes(name, options, chosen, fixed=()):
@@ -655,6 +792,7 @@ def render(query, data, users, error=""):
         headers="".join(header_html(c) for c in args.columns),
         rows=table_rows(rows, args.columns),
         tickets="\n".join(ticket_html(r) for r in rows),
+        token=TOKEN,
     )
 
 
@@ -691,6 +829,33 @@ class Handler(BaseHTTPRequestHandler):
         body = render(query, Handler.data, Handler.users, error).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        """Start a review in a new Terminal window. Only this server's own
+        page may ask: the request must be addressed to this server by its
+        local name and carry the token the page was given, so no other web
+        page can make the server run anything."""
+        length = int(self.headers.get("Content-Length") or 0)
+        form = parse_qs(self.rfile.read(length).decode(errors="replace"))
+        port = self.server.server_port
+        if (
+            urlparse(self.path).path != "/review"
+            or self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}")
+            or not secrets.compare_digest(first(form, "token"), TOKEN)
+        ):
+            self.send_error(403)
+            return
+        try:
+            open_terminal(review_command(first(form, "key")))
+            result = {}
+        except RuntimeError as e:
+            result = {"error": str(e)}
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
